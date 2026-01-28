@@ -21,7 +21,7 @@ spec:
       containers:
       - name: mobsf
         # REPLACE 'your-username' with your actual Docker Hub username
-        image: batataman26/mobile-security-framework-mobsf:latest
+        image: bakingbrain/mobsf:latest
         ports:
         - containerPort: 8000
         - containerPort: 1337
