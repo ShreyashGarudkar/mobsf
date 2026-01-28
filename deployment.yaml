@@ -17,7 +17,7 @@ spec:
       # CRITICAL: This ensures MobSF runs on your worker node.
       # Run 'kubectl get nodes' and replace 'worker-node-name' with the actual name.
       nodeSelector:
-        kubernetes.io/hostname: minikube
+        kubernetes.io/hostname: database
       containers:
       - name: mobsf
         # REPLACE 'your-username' with your actual Docker Hub username
