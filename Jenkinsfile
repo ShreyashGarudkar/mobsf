@@ -1,135 +1,103 @@
 pipeline {
-    agent {
-        kubernetes {
-            yaml '''
-apiVersion: v1
-kind: Pod
-spec:
-  containers:
-  - name: jnlp
-    image: jenkins/inbound-agent:latest-jdk17
-    securityContext:
-      runAsUser: 0
-    env:
-    - name: JAVA_HOME
-      value: /opt/java/openjdk
-    resources:
-      limits:
-        memory: "4Gi"
-        cpu: "2000m"
-      requests:
-        memory: "2Gi"
-        cpu: "1000m"
-    volumeMounts:
-    - name: docker-sock
-      mountPath: /var/run/docker.sock
-    command: ["/bin/sh", "-c"]
-    args: ["apt-get update && apt-get install -y python3 python3-pip git curl docker.io && exec $(which jenkins-agent)"]
-  volumes:
-  - name: docker-sock
-    hostPath:
-      path: /var/run/docker.sock
-'''
-        }
-    }
-
+    agent any
+    
     environment {
-        IMAGE_NAME = "batataman26/mobile-security-framework-mobsf:${env.BUILD_NUMBER}"
-        SCANNER_HOME = tool 'SonarScanner' 
-        KUBECONFIG_FILE = credentials('kubeconfig') 
+        DOCKER_HUB_USER = 'bakingbrain'
+        APP_NAME        = 'mobsf'
+        // Use a unique tag combining build number and timestamp for traceability
+        IMAGE_TAG       = "${DOCKER_HUB_USER}/${APP_NAME}:${BUILD_NUMBER}"
+        // Credentials IDs from Jenkins Global Store
+        DOCKER_CREDS    = 'dockerhubcred'
+        SONAR_SCANNER   = tool 'SonarQube'
     }
 
     stages {
-        stage('Clone Code') {
+        stage('Preparation') {
             steps {
-                git branch: 'main', url: 'https://github.com/Srshinde5512/mobile-security.git'
+                // Clean workspace and pull fresh code
+                cleanWs()
+                git branch: "main", url: "https://github.com/ShreyashGarudkar/mobsf.git"
             }
         }
-        
-       stage('Install Dependencies & Test') {
+
+        stage('Security & Quality Scans') {
+            parallel {
+                stage('SonarQube Analysis') {
+                    steps {
+                        withSonarQubeEnv('SonarQube') {
+                            sh "${SONAR_SCANNER}/bin/sonar-scanner \
+                                -Dsonar.projectName=${APP_NAME} \
+                                -Dsonar.projectKey=${APP_NAME}"
+                        }
+                    }
+                }
+                stage('OWASP Dependency Check') {
+                    steps {
+                        dependencyCheck additionalArguments: '--scan ./', odcInstallation: 'owasp-check'
+                        dependencyCheckPublisher pattern: '**/dependency-check-report.xml'
+                    }
+                }
+            }
+        }
+        stage('Build Image') {
             steps {
                 script {
-                    sh '''
-                        # 1. Install poetry globally in the agent
-                        python3 -m pip install poetry --break-system-packages
-                        
-                        # 2. Try to install dependencies
-                        python3 -m poetry install --with test,dev || python3 -m poetry install
-                        
-                        # 3. Explicitly ensure pytest is in the virtualenv
-                        python3 -m poetry run pip install pytest pytest-cov 
-                        
-                        # 4. Run tests
-                        # Correct command to find and run MobSF tests
-                        python3 -m poetry run pytest tests/ --cov=mobsf --cov-report=xml:coverage.xml || echo "Tests failed but generating report"
-                    '''
+                    echo "Building the Docker image..."
+                    // Build once with both tags (versioned and latest)
+                    sh "docker build -t ${IMAGE_TAG} -t ${DOCKER_HUB_USER}/${APP_NAME}:latest ."
                 }
             }
         }
 
-        stage('SonarQube Analysis') {
+        stage('Trivy Image Scan') {
             steps {
                 script {
-                    withSonarQubeEnv('sonar-server') {
-                        sh "${SCANNER_HOME}/bin/sonar-scanner \
-                          -Dsonar.projectKey=mobsf-project \
-                          -Dsonar.exclusions=**/axml.py,**/StaticAnalyzer/tools/** \
-                          -Dsonar.javascript.node.maxspace=1024 \
-                          -Dsonar.python.coverage.reportPaths=coverage.xml"
+                    echo "Scanning image for vulnerabilities..."
+                    // --exit-code 1 will fail the pipeline if HIGH or CRITICAL issues are found
+                    sh "trivy image --severity HIGH,CRITICAL --timeout 15m$ {IMAGE_TAG}"
+                }
+            }
+        } 
+
+        stage('Push to Docker Hub') {
+            steps {
+                script {
+                    withCredentials([usernamePassword(credentialsId: "${DOCKER_CREDS}", 
+                                     passwordVariable: 'PASS', usernameVariable: 'USER')]) {
+                        sh "echo \$PASS | docker login -u \$USER --password-stdin"
+                        echo "Pushing versioned image: ${IMAGE_TAG}"
+                        sh "docker push ${IMAGE_TAG}"
+                        echo "Pushing latest tag..."
+                        sh "docker push ${DOCKER_HUB_USER}/${APP_NAME}:latest"
                     }
                 }
             }
         }
 
-        stage('Quality Gate') {
-            steps {
-                timeout(time: 5, unit: 'MINUTES') {
-                    waitForQualityGate abortPipeline: true
-                }
-            }
-        }
 
-        stage('Build Docker Image') {
-           steps {
-               script {
-            // This ensures Debian treats the script as a runnable program 
-            // before the Docker context is sent to the builder
-                      sh "chmod +x scripts/dependencies.sh"
-                      sh "docker build -t ${IMAGE_NAME} ."
-        }
-    }
-}
-
-        stage('Push Image') {
+        stage('Kubernetes Deployment') {
             steps {
-                script {
-                    // Note: Ensure credential ID 'dockerhub-creds' exists in Jenkins
-                    docker.withRegistry('https://index.docker.io/v1/', 'dockerhub-creds') {
-                        sh "docker push ${IMAGE_NAME}"
-                    }
-                }
-            }
-        }
-
-        stage('Deploy to Kubernetes') {
-            steps {
-                script {
-                    sh "sed -i 's|batataman26/mobile-security-framework-mobsf:latest|${IMAGE_NAME}|g' deployment.yaml"
-                    sh "kubectl --kubeconfig=${KUBECONFIG_FILE} apply -f deployment.yaml"
-                }
+                // 'kubectl apply' handles both first-time creation and updates
+                sh "kubectl apply -f deployment.yaml"
+                // Update the specific container with the new versioned image
+                sh "kubectl set image deployment/mobsf mobsf=${IMAGE_TAG}" // here mobsf is container name
+                // Verify the rollout status
+                sh "kubectl rollout status deployment/mobsf"
             }
         }
     }
 
     post {
         always {
-            script {
-                try {
-                    sh "docker rmi ${IMAGE_NAME} || true"
-                } catch (Exception e) {
-                    echo "Could not remove image: ${e.message}"
-                }
-            }
+            // Cleanup to save disk space on the Jenkins server
+            sh "docker rmi ${IMAGE_TAG} || true"
+            sh "docker image prune -f"
+        }
+        success {
+            echo "Successfully deployed version ${BUILD_NUMBER}"
+        }
+        failure {
+            echo "Pipeline failed! Check the logs for security scan failures."
         }
     }
 }
